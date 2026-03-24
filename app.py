@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-import json
+import requests
 import os
 
 # ── 페이지 설정 ────────────────────────────────────────────
@@ -53,27 +53,99 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── 데이터 로드 ────────────────────────────────────────────
-DATA_PATH = os.path.join(os.path.dirname(__file__), "data.json")
+# ── Notion 설정 ────────────────────────────────────────────
+NOTION_TOKEN = st.secrets.get("NOTION_TOKEN", os.environ.get("NOTION_TOKEN", ""))
+DATABASE_ID  = "32c7e8b3-2a5a-80af-aa4c-c6a3df546a5d"
 
-@st.cache_data
-def load_data():
-    if not os.path.exists(DATA_PATH):
-        return pd.DataFrame()
-    with open(DATA_PATH, "r", encoding="utf-8") as f:
-        return pd.DataFrame(json.load(f))
+def parse_num(text):
+    if not text:
+        return None
+    try:
+        return float(str(text).replace(",", "").replace("원", "").replace("%", "").strip())
+    except:
+        return None
+
+@st.cache_data(ttl=300)
+def load_notion_data():
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    pages, cursor = [], None
+
+    while True:
+        body = {"start_cursor": cursor} if cursor else {}
+        resp = requests.post(
+            f"https://api.notion.com/v1/databases/{DATABASE_ID}/query",
+            headers=headers, json=body,
+        )
+        if resp.status_code != 200:
+            st.error(f"Notion API 오류 {resp.status_code}: {resp.json().get('message', '')}")
+            return pd.DataFrame()
+        data = resp.json()
+        pages.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+
+    rows = []
+    for page in pages:
+        p = page["properties"]
+
+        def txt(key):
+            prop = p.get(key, {})
+            t = prop.get("title") or prop.get("rich_text") or []
+            return "".join(x["plain_text"] for x in t).strip() or None
+
+        def sel(key):
+            s = p.get(key, {}).get("select")
+            return s["name"] if s else None
+
+        def date(key):
+            d = p.get(key, {}).get("date")
+            return d["start"] if d else None
+
+        name = txt("이름")
+        if not name or name == "새 페이지":
+            continue
+
+        rows.append({
+            "이름":     name,
+            "지출금액": parse_num(txt("지출금액")),
+            "ROAS":     parse_num(txt("ROAS")),
+            "CPM":      parse_num(txt("CPM")),
+            "CPA":      parse_num(txt("결과당비용(CPA)")),
+            "구매수":   parse_num(txt("구매수")),
+            "노출":     parse_num(txt("노출")),
+            "도달":     parse_num(txt("도달")),
+            "빈도":     parse_num(txt("빈도")),
+            "보고기간": txt("보고기간"),
+            "소재분석": txt("소재분석"),
+            "소재평가": sel("소재평가"),
+            "소재유형": sel("선택"),
+            "주차":     date("주차"),
+        })
+
+    return pd.DataFrame(rows)
+
 
 # ── UI 시작 ────────────────────────────────────────────────
 st.markdown("## 📊 광고 소재 성과 대시보드")
 
-df = load_data()
+if not NOTION_TOKEN:
+    st.error("⚠️ NOTION_TOKEN이 설정되지 않았습니다.")
+    st.stop()
+
+with st.spinner("노션에서 데이터 불러오는 중..."):
+    df = load_notion_data()
 
 if df.empty:
-    st.info("아직 데이터가 없습니다. 매주 워크플로우 실행 후 자동으로 업데이트됩니다.")
+    st.warning("데이터가 없습니다. 노션 DB를 확인해주세요.")
     st.stop()
 
 # ── 주차 선택 ──────────────────────────────────────────────
-weeks = sorted(df["주차"].dropna().unique(), reverse=True) if "주차" in df.columns and df["주차"].notna().any() else []
+weeks = sorted(df["주차"].dropna().unique(), reverse=True) if df["주차"].notna().any() else []
 
 if not weeks:
     periods = sorted(df["보고기간"].dropna().unique(), reverse=True)
